@@ -145,6 +145,13 @@ prompt_encryption() {
     ask "Encryption algorithm" "$DEFAULT_ENCRYPTION" ENCRYPT_BLOCK
 }
 
+prompt_mtu() {
+    echo ""
+    info "MTU (Maximum Transmission Unit) controls packet size."
+    info "Default is 1100, which works well for most networks."
+    ask "MTU" "1100" MTU
+}
+
 prompt_tcp_flags() {
     echo ""
     info "TCP flags control how paqet crafts packets to bypass firewalls."
@@ -274,7 +281,7 @@ transport:
                               # false = batch ACKs (more bandwidth efficient)
                               # Setting true reduces latency but increases bandwidth usage
 
-    # mtu: 1350              # Maximum transmission unit (50-1500)
+    mtu: ${MTU}              # Maximum transmission unit (50-1500)
     # rcvwnd: 1024           # Receive window size (default for server)
     # sndwnd: 1024           # Send window size (default for server)
 
@@ -409,6 +416,7 @@ print_summary() {
     echo "  Interface:    ${NET_INTERFACE}"
     echo "  KCP mode:     ${KCP_MODE}"
     echo "  Encryption:   ${ENCRYPT_BLOCK}"
+    echo "  MTU:          ${MTU}"
     echo "  TCP flags:   [${LOCAL_FLAG}]"
     echo ""
     warn "Copy the KCP secret key and port to your client config."
@@ -429,23 +437,26 @@ main() {
     check_network_tools
 
     echo ""
-    info "Step 1/5: Server port"
+    info "Step 1/7: Server port"
     prompt_server_port
 
-    info "Step 2/5: Network configuration"
+    info "Step 2/7: Network configuration"
     prompt_network_details
 
-    info "Step 3/5: KCP encryption key"
+    info "Step 3/7: KCP encryption key"
     prompt_kcp_key
 
-    info "Step 4/5: KCP mode & encryption"
+    info "Step 4/7: KCP mode & encryption"
     prompt_kcp_mode
     prompt_encryption
 
-    info "Step 5/6: TCP flags for packet crafting"
+    info "Step 5/7: MTU"
+    prompt_mtu
+
+    info "Step 6/7: TCP flags for packet crafting"
     prompt_tcp_flags
 
-    info "Step 6/6: Download & install"
+    info "Step 7/7: Download & install"
     download_paqet
     generate_config
     setup_firewall
