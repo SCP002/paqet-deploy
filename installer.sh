@@ -198,35 +198,101 @@ generate_config() {
     local config="${INSTALL_DIR}/server.yaml"
 
     cat >"$config" <<EOF
-# Paqet Server Configuration
-
+# paqet Server Configuration
+# Role must be explicitly set
 role: "server"
 
-# Logging
+# Logging configuration
 log:
-  level: "${DEFAULT_LOG_LEVEL}"
+  level: "${DEFAULT_LOG_LEVEL}"  # none, debug, info, warn, error, fatal
 
-# Server listen
+# Server listen configuration
 listen:
-  addr: ":${SERVER_PORT}"
+  addr: ":${SERVER_PORT}"   # Server listen port (must match network.ipv4.addr port)
+                            # WARNING: Do not use standard ports (80, 443, etc.) as iptables rules
+                            # can affect outgoing server connections.
 
-# Network interface
+# Network interface settings
 network:
-  interface: "${NET_INTERFACE}"
-  ipv4:
-    addr: "${SERVER_IPV4_ADDR}"
-    router_mac: "${NET_GW_MAC}"
-  tcp:
-    local_flag: ["${LOCAL_FLAG}"]
+  interface: "${NET_INTERFACE}"              # Network interface (eth0, ens3, en0, etc.)
+  # guid: "\Device\NPF_{...}"                # Windows only (Npcap).
 
-# Transport
+  # IPv4 configuration
+  ipv4:
+    addr: "${SERVER_IPV4_ADDR}"          # Server IPv4 and port (port must match listen.addr)
+    router_mac: "${NET_GW_MAC}"          # Gateway/router MAC address
+
+  # IPv6 configuration (optional)
+  # ipv6:
+    # addr: "[::1]:9999"                       # Server IPv6 and port (or remove if not using IPv6)
+    # router_mac: "aa:bb:cc:dd:ee:ff"          # Gateway/router MAC address
+
+  # TCP flags for packet crafting (optional - will use defaults)
+  tcp:
+    local_flag: ["${LOCAL_FLAG}"]                       # Local TCP flags (Push+Ack default)
+
+  # PCAP settings (optional - will use defaults)
+  # pcap:
+    # sockbuf: 8388608                         # 8MB buffer (default for server)
+
+# Transport protocol configuration
 transport:
-  protocol: "kcp"
-  conn: 1
+  protocol: "kcp"  # Transport protocol (currently only "kcp" supported)
+  conn: 1          # Number of connections (1-256, default: 1)
+
+  # tcpbuf: 8192   # TCP buffer size in bytes
+  # udpbuf: 4096   # UDP buffer size in bytes
+
+  # KCP protocol settings
   kcp:
-    mode: "${KCP_MODE}"
-    block: "${ENCRYPT_BLOCK}"
-    key: "${KCP_KEY}"
+    mode: "${KCP_MODE}"              # KCP mode: normal, fast, fast2, fast3, manual
+
+    # Manual mode parameters (only used when mode="manual")
+    # nodelay: 1              # 0=disable, 1=enable
+                              # Enable for lower latency & aggressive retransmission
+                              # Disable for TCP-like conservative behavior
+
+    # interval: 10            # Internal update timer interval in milliseconds (10-5000ms)
+                              # Lower values increase responsiveness but raise CPU usage
+
+    # resend: 2               # Fast retransmit trigger (0-2)
+                              # 0 = disabled (wait for timeout only)
+                              # 1 = most aggressive (retransmit after 1 ACK skip)
+                              # 2 = aggressive (retransmit after 2 ACK skips)
+
+    # nocongestion: 1         # Congestion control: 0=enabled, 1=disabled
+                              # 0 = TCP-like fair congestion control (slow start, congestion avoidance)
+                              # 1 = disable congestion control for maximum speed
+
+    # wdelay: false           # Write batching behavior
+                              # false = flush immediately (low latency, recommended for real-time)
+                              # true = batch writes until next update interval (higher throughput)
+                              # Controls when data is actually sent to the network
+
+    # acknodelay: true        # ACK sending behavior
+                              # true = send ACKs immediately when packets are received (lower latency)
+                              # false = batch ACKs (more bandwidth efficient)
+                              # Setting true reduces latency but increases bandwidth usage
+
+    # mtu: 1350              # Maximum transmission unit (50-1500)
+    # rcvwnd: 1024           # Receive window size (default for server)
+    # sndwnd: 1024           # Send window size (default for server)
+
+    # Encryption settings
+    block: "${ENCRYPT_BLOCK}" # Encryption: aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null.
+    key: "${KCP_KEY}"         # Secret key (must match client)
+
+    # Buffer settings (optional)
+    # smuxbuf: 4194304       # 4MB SMUX buffer
+    # streambuf: 2097152     # 2MB stream buffer
+
+    # smuxkalive: 2       # SMUX keepalive interval (seconds)
+    # smuxktimeout: 8     # SMUX keepalive timeout (seconds)
+
+# Optional Forward Error Correction (FEC) - currently disabled
+# Use these only if you need FEC for very lossy networks:
+#   dshard: 10    # Data shards for FEC
+#   pshard: 3     # Parity shards for FEC
 EOF
 
     chmod 600 "$config"
