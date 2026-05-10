@@ -416,6 +416,7 @@ print_summary() {
     echo "  Interface:    ${NET_INTERFACE}"
     echo "  KCP mode:     ${KCP_MODE}"
     echo "  Encryption:   ${ENCRYPT_BLOCK}"
+    echo "  KCP Key:      ${KCP_KEY}"
     echo "  MTU:          ${MTU}"
     echo "  TCP flags:   [${LOCAL_FLAG}]"
     echo ""
