@@ -15,9 +15,10 @@ INSTALL_DIR="/opt/paqet"
 SERVICE_NAME="paqet-server"
 CONFIG_FILE="${INSTALL_DIR}/server.yaml"
 
-# Runtime options
-MODE="install" # install | upgrade
-INSTALLED_VERSION=""
+# Runtime state
+MODE="install" # install | upgrade (set by --upgrade or existing-install prompt)
+PAQET_VERSION=""     # latest release tag, resolved before any prompts
+INSTALLED_VERSION="" # version reported by the installed binary
 
 # Network defaults
 DEFAULT_PORT="9999"
@@ -69,9 +70,14 @@ check_required_tools() {
 
 # User input with defaults
 detect_network_info() {
-    # Detect primary interface (first non-loopback, non-docker with an IPv4)
+    # Detect primary interface: the one carrying the default route, so it
+    # matches the gateway detected below. Fall back to the first non-loopback,
+    # non-container interface with an IPv4 address.
     local iface
-    iface=$(ip -4 -o addr show | awk '$2 !~ /^(lo|docker|br-|veth)/ {print $2; exit}')
+    iface=$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+    if [[ -z "$iface" ]]; then
+        iface=$(ip -4 -o addr show | awk '$2 !~ /^(lo|docker|br-|veth)/ {print $2; exit}')
+    fi
     iface="${iface:-eth0}"
 
     # Detect local IPv4
@@ -109,11 +115,14 @@ ask() {
 }
 
 prompt_server_port() {
-    ask "Server listen port (non-standard recommended, e.g. 9999)" "$DEFAULT_PORT" SERVER_PORT
-    if [[ "$SERVER_PORT" -lt 1 || "$SERVER_PORT" -gt 65535 ]] 2>/dev/null; then
-        error "Invalid port number: $SERVER_PORT"
-        exit 1
-    fi
+    while true; do
+        ask "Server listen port (non-standard recommended, e.g. 9999)" "$DEFAULT_PORT" SERVER_PORT
+        if [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] && ((10#$SERVER_PORT >= 1 && 10#$SERVER_PORT <= 65535)); then
+            SERVER_PORT=$((10#$SERVER_PORT))
+            return
+        fi
+        error "Invalid port number: $SERVER_PORT (must be 1-65535)"
+    done
 }
 
 prompt_kcp_key() {
@@ -137,7 +146,17 @@ prompt_network_details() {
 
     ask "Network interface name" "$DET_IFACE" NET_INTERFACE
     ask "Server IPv4 address" "$DET_IPV4" NET_IPV4
-    ask "Gateway/router MAC address" "$DET_MAC" NET_GW_MAC
+    if [[ -z "$DET_MAC" ]]; then
+        warn "Could not detect the gateway MAC address."
+        warn "Find it with: ip neigh show ${DET_GW:-<gateway-ip>}"
+    fi
+    while true; do
+        ask "Gateway/router MAC address" "$DET_MAC" NET_GW_MAC
+        if [[ "$NET_GW_MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+            break
+        fi
+        error "Invalid MAC address: '${NET_GW_MAC}' (expected format aa:bb:cc:dd:ee:ff)"
+    done
 
     SERVER_IPV4_ADDR="${NET_IPV4}:${SERVER_PORT}"
 }
@@ -176,16 +195,20 @@ prompt_tcp_flags() {
 }
 
 # Download & install
-download_paqet() {
-    # Release asset names contain the version, so resolve the latest tag first
-    local version
-    version=$(curl -sI "https://github.com/hanselime/paqet/releases/latest" |
+# Release asset names contain the version, so the latest tag is needed to build
+# the download URL. Resolved before any prompts so a network failure exits early.
+resolve_version() {
+    PAQET_VERSION=$(curl -sI "https://github.com/hanselime/paqet/releases/latest" |
         sed -n 's/^[Ll]ocation:.*\/tag\///p' | tr -d '\r')
-    if [[ -z "$version" ]]; then
+    if [[ -z "$PAQET_VERSION" ]]; then
         error "Failed to fetch latest release version."
         exit 1
     fi
+    info "Latest paqet version: ${PAQET_VERSION}"
+}
 
+download_paqet() {
+    local version="$PAQET_VERSION"
     local url="https://github.com/hanselime/paqet/releases/download/${version}/paqet-linux-${PAQET_ARCH}-${version}.tar.gz"
 
     local tmpdir
@@ -327,6 +350,47 @@ EOF
 }
 
 # iptables firewall rules
+print_manual_firewall_rules() {
+    echo ""
+    echo "  iptables -t raw -A PREROUTING -p tcp --dport ${SERVER_PORT} -j NOTRACK -m comment --comment \"paqet\""
+    echo "  iptables -t raw -A OUTPUT -p tcp --sport ${SERVER_PORT} -j NOTRACK -m comment --comment \"paqet\""
+    echo "  iptables -t mangle -A OUTPUT -p tcp --sport ${SERVER_PORT} --tcp-flags RST RST -j DROP -m comment --comment \"paqet\""
+    echo ""
+}
+
+# Add a rule unless it already exists. Usage: add_rule <table> <chain> <rule args...>
+add_rule() {
+    local table="$1" chain="$2" desc="$3"
+    shift 3
+    if iptables -t "$table" -C "$chain" "$@" -m comment --comment "paqet" 2>/dev/null; then
+        warn "${desc} rule already exists for port ${SERVER_PORT}, skipping."
+    else
+        iptables -t "$table" -A "$chain" "$@" -m comment --comment "paqet"
+        info "${desc} rule added."
+    fi
+}
+
+save_firewall_rules() {
+    if command -v netfilter-persistent &>/dev/null; then
+        # Debian/Ubuntu with iptables-persistent: saves and reloads at boot
+        netfilter-persistent save >/dev/null
+        info "Rules saved with netfilter-persistent (restored at boot)."
+    elif systemctl list-unit-files iptables.service &>/dev/null &&
+        systemctl list-unit-files iptables.service | grep -q '^iptables\.service'; then
+        # RHEL/CentOS/Fedora with iptables-services
+        iptables-save >/etc/sysconfig/iptables
+        systemctl enable iptables &>/dev/null || true
+        info "Rules saved to /etc/sysconfig/iptables (restored at boot by iptables.service)."
+    else
+        mkdir -p /etc/iptables
+        iptables-save >/etc/iptables/rules.v4
+        warn "Rules saved to /etc/iptables/rules.v4, but nothing on this system loads them at boot."
+        warn "Install a loader to make them persistent:"
+        warn "  Debian/Ubuntu: apt install iptables-persistent"
+        warn "  RHEL/Fedora:   dnf install iptables-services && systemctl enable iptables"
+    fi
+}
+
 setup_firewall() {
     echo ""
     warn "PAQET REQUIRES iptables RULES to prevent kernel interference."
@@ -338,56 +402,51 @@ setup_firewall() {
 
     case "$confirm" in
     y | Y | yes | Yes | YES)
+        if ! command -v iptables &>/dev/null; then
+            error "'iptables' command not found, cannot apply rules."
+            warn "Install iptables, then add these rules manually:"
+            print_manual_firewall_rules
+            return
+        fi
+
         info "Applying iptables rules..."
-
         # NOTRACK incoming traffic on server port
-        if iptables -t raw -C PREROUTING -p tcp --dport "$SERVER_PORT" -j NOTRACK -m comment --comment "paqet" 2>/dev/null; then
-            warn "NOTRACK PREROUTING rule already exists for port ${SERVER_PORT}, skipping."
-        else
-            iptables -t raw -A PREROUTING -p tcp --dport "$SERVER_PORT" -j NOTRACK -m comment --comment "paqet"
-            info "NOTRACK PREROUTING rule added."
-        fi
-
+        add_rule raw PREROUTING "NOTRACK PREROUTING" -p tcp --dport "$SERVER_PORT" -j NOTRACK
         # NOTRACK outgoing traffic from server port
-        if iptables -t raw -C OUTPUT -p tcp --sport "$SERVER_PORT" -j NOTRACK -m comment --comment "paqet" 2>/dev/null; then
-            warn "NOTRACK OUTPUT rule already exists for port ${SERVER_PORT}, skipping."
-        else
-            iptables -t raw -A OUTPUT -p tcp --sport "$SERVER_PORT" -j NOTRACK -m comment --comment "paqet"
-            info "NOTRACK OUTPUT rule added."
-        fi
-
+        add_rule raw OUTPUT "NOTRACK OUTPUT" -p tcp --sport "$SERVER_PORT" -j NOTRACK
         # DROP TCP RST packets from server port
-        if iptables -t mangle -C OUTPUT -p tcp --sport "$SERVER_PORT" --tcp-flags RST RST -j DROP -m comment --comment "paqet" 2>/dev/null; then
-            warn "RST DROP rule already exists for port ${SERVER_PORT}, skipping."
-        else
-            iptables -t mangle -A OUTPUT -p tcp --sport "$SERVER_PORT" --tcp-flags RST RST -j DROP -m comment --comment "paqet"
-            info "RST DROP rule added."
-        fi
+        add_rule mangle OUTPUT "RST DROP" -p tcp --sport "$SERVER_PORT" --tcp-flags RST RST -j DROP
 
         if command -v iptables-save &>/dev/null; then
             local persist
             ask "Save iptables rules for persistence across reboots?" "yes" persist
             case "$persist" in
-            y | Y | yes | Yes | YES)
-                mkdir -p /etc/iptables
-                iptables-save >/etc/iptables/rules.v4
-                info "Rules saved to /etc/iptables/rules.v4"
-                ;;
+            y | Y | yes | Yes | YES) save_firewall_rules ;;
             esac
         fi
         ;;
     *)
         warn "Skipping firewall configuration. You MUST add these rules manually:"
-        echo ""
-        echo "  iptables -t raw -A PREROUTING -p tcp --dport ${SERVER_PORT} -j NOTRACK -m comment --comment \"paqet\""
-        echo "  iptables -t raw -A OUTPUT -p tcp --sport ${SERVER_PORT} -j NOTRACK -m comment --comment \"paqet\""
-        echo "  iptables -t mangle -A OUTPUT -p tcp --sport ${SERVER_PORT} --tcp-flags RST RST -j DROP -m comment --comment \"paqet\""
-        echo ""
+        print_manual_firewall_rules
         ;;
     esac
 }
 
 # Systemd service
+# Check that the service is still running a few seconds after (re)start, so
+# config errors (e.g. after an upgrade) are reported instead of a false success.
+verify_service() {
+    sleep 3
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        info "Service is running: ${SERVICE_NAME}"
+        return 0
+    fi
+    error "Service ${SERVICE_NAME} failed to start. Recent logs:"
+    journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
+    error "Fix the problem, then run: systemctl restart ${SERVICE_NAME}"
+    exit 1
+}
+
 setup_service() {
     echo ""
     local confirm
@@ -417,8 +476,8 @@ EOF
         systemctl enable "$SERVICE_NAME"
         # restart (not start) so a re-run picks up the new binary and config
         systemctl restart "$SERVICE_NAME"
-        info "Service created, enabled and started: ${SERVICE_NAME}"
-        info "Status: systemctl status ${SERVICE_NAME}"
+        info "Service created and enabled: ${SERVICE_NAME}"
+        verify_service
         ;;
     *)
         info "No systemd service created."
@@ -468,6 +527,7 @@ run_upgrade() {
     if systemctl is-enabled "$SERVICE_NAME" &>/dev/null; then
         systemctl restart "$SERVICE_NAME"
         info "Service restarted: ${SERVICE_NAME}"
+        verify_service
     else
         warn "No ${SERVICE_NAME} systemd service found; restart paqet manually."
     fi
@@ -545,6 +605,7 @@ main() {
     check_arch
     check_required_tools
     check_existing_install
+    resolve_version
 
     if [[ "$MODE" == "upgrade" ]]; then
         run_upgrade
