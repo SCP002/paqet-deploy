@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # installer.sh - Paqet Server Deployment Script
 # https://github.com/hanselime/paqet
+#
+# Usage:
+#   installer.sh [--upgrade]
+#
+#   --upgrade        Only replace the paqet binary, keep the existing config
+#                    and restart the service.
 
 set -euo pipefail
 
 # Configuration defaults
 INSTALL_DIR="/opt/paqet"
 SERVICE_NAME="paqet-server"
+CONFIG_FILE="${INSTALL_DIR}/server.yaml"
+
+# Runtime options
+MODE="install" # install | upgrade
+INSTALLED_VERSION=""
 
 # Network defaults
 DEFAULT_PORT="9999"
@@ -38,6 +49,7 @@ check_arch() {
     case "$ARCH" in
     x86_64 | amd64) PAQET_ARCH="amd64" ;;
     aarch64 | arm64) PAQET_ARCH="arm64" ;;
+    armv7* | armv8l | armhf) PAQET_ARCH="arm32" ;;
     *)
         error "Unsupported architecture: $ARCH"
         exit 1
@@ -46,8 +58,8 @@ check_arch() {
     info "Detected architecture: $ARCH"
 }
 
-check_network_tools() {
-    for cmd in ip arp; do
+check_required_tools() {
+    for cmd in ip curl tar; do
         if ! command -v "$cmd" &>/dev/null; then
             error "Required command '$cmd' not found. Please install it."
             exit 1
@@ -76,7 +88,7 @@ detect_network_info() {
     local mac=""
     if [[ -n "$gw" ]]; then
         ping -c 1 -W 1 "$gw" &>/dev/null || true
-        mac=$(arp -n "$gw" 2>/dev/null | grep -i ether | awk '{print $3}')
+        mac=$(ip neigh show "$gw" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "lladdr") {print $(i + 1); exit}}')
     fi
 
     echo "$iface|$ipv4|$gw|$mac"
@@ -165,44 +177,55 @@ prompt_tcp_flags() {
 
 # Download & install
 download_paqet() {
+    # Release asset names contain the version, so resolve the latest tag first
     local version
-    version=$(curl -sI "https://github.com/hanselime/paqet/releases/latest" | sed -n 's/^location:.*\/tag\///p' | tr -d '\r')
+    version=$(curl -sI "https://github.com/hanselime/paqet/releases/latest" |
+        sed -n 's/^[Ll]ocation:.*\/tag\///p' | tr -d '\r')
     if [[ -z "$version" ]]; then
         error "Failed to fetch latest release version."
         exit 1
     fi
 
-    local tarball="${INSTALL_DIR}/paqet.tar.gz"
     local url="https://github.com/hanselime/paqet/releases/download/${version}/paqet-linux-${PAQET_ARCH}-${version}.tar.gz"
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" EXIT
 
     mkdir -p "$INSTALL_DIR"
 
     info "Downloading paqet ${version} for linux/${PAQET_ARCH}..."
-    if curl -fSL --progress-bar "$url" -o "$tarball"; then
-        tar -xzf "$tarball" -C "$INSTALL_DIR"
-        rm -f "$tarball"
-
-        # Archive contains e.g. paqet_linux_amd64 - rename to paqet
-        for f in "${INSTALL_DIR}"/paqet_linux_*; do
-            if [[ -f "$f" && "$(basename "$f")" != "paqet" ]]; then
-                mv "$f" "${INSTALL_DIR}/paqet"
-                break
-            fi
-        done
-
-        chmod +x "${INSTALL_DIR}/paqet"
-        info "Installed to ${INSTALL_DIR}/paqet (version ${version})"
-    else
-        error "Download failed."
+    if ! curl -fSL --progress-bar "$url" -o "${tmpdir}/paqet.tar.gz"; then
+        error "Download failed: ${url}"
         error "Available releases: https://github.com/hanselime/paqet/releases"
         exit 1
     fi
+
+    tar -xzf "${tmpdir}/paqet.tar.gz" -C "$tmpdir"
+
+    # Archive contains e.g. paqet_linux_amd64 - install it as paqet
+    local bin
+    bin=$(find "$tmpdir" -maxdepth 1 -type f -name 'paqet_linux_*' | head -1)
+    if [[ -z "$bin" ]]; then
+        error "paqet binary not found in the release archive."
+        exit 1
+    fi
+
+    # Install via a temp file + rename so a running binary is replaced atomically
+    install -m 755 "$bin" "${INSTALL_DIR}/paqet.new"
+    mv -f "${INSTALL_DIR}/paqet.new" "${INSTALL_DIR}/paqet"
+
+    # "paqet version" prints e.g. "Version:    v1.0.0-alpha.21"
+    INSTALLED_VERSION=$("${INSTALL_DIR}/paqet" version 2>/dev/null | awk '/^Version:/ {print $2; exit}' || true)
+    INSTALLED_VERSION="${INSTALLED_VERSION:-$version}"
+    info "Installed to ${INSTALL_DIR}/paqet (${version})"
 }
 
 # Configuration generation
 generate_config() {
     mkdir -p "$INSTALL_DIR"
-    local config="${INSTALL_DIR}/server.yaml"
+    local config="$CONFIG_FILE"
 
     cat >"$config" <<EOF
 # paqet Server Configuration
@@ -246,9 +269,6 @@ network:
 transport:
   protocol: "kcp"  # Transport protocol (currently only "kcp" supported)
   conn: 1          # Number of connections (1-256, default: 1)
-
-  # tcpbuf: 8192   # TCP buffer size in bytes
-  # udpbuf: 4096   # UDP buffer size in bytes
 
   # KCP protocol settings
   kcp:
@@ -384,7 +404,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/paqet run -c ${INSTALL_DIR}/server.yaml
+ExecStart=${INSTALL_DIR}/paqet run -c ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=5
 User=root
@@ -394,13 +414,15 @@ WantedBy=multi-user.target
 EOF
 
         systemctl daemon-reload
-        systemctl enable --now "$SERVICE_NAME"
+        systemctl enable "$SERVICE_NAME"
+        # restart (not start) so a re-run picks up the new binary and config
+        systemctl restart "$SERVICE_NAME"
         info "Service created, enabled and started: ${SERVICE_NAME}"
         info "Status: systemctl status ${SERVICE_NAME}"
         ;;
     *)
         info "No systemd service created."
-        info "Run manually: ${INSTALL_DIR}/paqet run -c ${INSTALL_DIR}/server.yaml"
+        info "Run manually: ${INSTALL_DIR}/paqet run -c ${CONFIG_FILE}"
         ;;
     esac
 }
@@ -410,15 +432,16 @@ print_summary() {
     echo ""
     echo "  Paqet Server Installation Complete"
     echo ""
+    echo "  Version:      ${INSTALLED_VERSION}"
     echo "  Binary:       ${INSTALL_DIR}/paqet"
-    echo "  Config:       ${INSTALL_DIR}/server.yaml"
+    echo "  Config:       ${CONFIG_FILE}"
     echo "  Listen:       :${SERVER_PORT}"
     echo "  Interface:    ${NET_INTERFACE}"
     echo "  KCP mode:     ${KCP_MODE}"
     echo "  Encryption:   ${ENCRYPT_BLOCK}"
     echo "  KCP Key:      ${KCP_KEY}"
     echo "  MTU:          ${MTU}"
-    echo "  TCP flags:   [${LOCAL_FLAG}]"
+    echo "  TCP flags:    [${LOCAL_FLAG}]"
     echo ""
     warn "Copy the KCP secret key and port to your client config."
     echo ""
@@ -427,15 +450,106 @@ print_summary() {
     fi
 }
 
+# Upgrade: replace the binary only, keep config and firewall rules
+run_upgrade() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error "No existing config found at ${CONFIG_FILE}; run without --upgrade to install."
+        exit 1
+    fi
+
+    local old_version=""
+    if [[ -x "${INSTALL_DIR}/paqet" ]]; then
+        old_version=$("${INSTALL_DIR}/paqet" version 2>/dev/null | awk '/^Version:/ {print $2; exit}' || true)
+    fi
+    info "Current version: ${old_version:-unknown}"
+
+    download_paqet
+
+    if systemctl is-enabled "$SERVICE_NAME" &>/dev/null; then
+        systemctl restart "$SERVICE_NAME"
+        info "Service restarted: ${SERVICE_NAME}"
+    else
+        warn "No ${SERVICE_NAME} systemd service found; restart paqet manually."
+    fi
+
+    echo ""
+    echo "  Paqet Server Upgrade Complete"
+    echo ""
+    echo "  Version:      ${old_version:-unknown} -> ${INSTALLED_VERSION}"
+    echo "  Binary:       ${INSTALL_DIR}/paqet"
+    echo "  Config:       ${CONFIG_FILE} (unchanged)"
+    echo ""
+}
+
+# Arguments
+usage() {
+    cat <<EOF
+Usage: installer.sh [--upgrade]
+
+  --upgrade        Only replace the paqet binary, keep the existing config
+                   and restart the service.
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --upgrade)
+            MODE="upgrade"
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            error "Unknown argument: $1"
+            usage
+            exit 1
+            ;;
+        esac
+    done
+}
+
+# Offer an upgrade when an existing install is detected
+check_existing_install() {
+    [[ "$MODE" == "install" && -f "$CONFIG_FILE" ]] || return 0
+
+    echo ""
+    warn "An existing paqet config was found at ${CONFIG_FILE}."
+    info "  upgrade   - replace the binary only, keep config and key (recommended)"
+    info "  reinstall - overwrite config and generate a new key (clients must be updated)"
+    info "  abort     - exit without changes"
+    local choice
+    ask "What would you like to do? (upgrade/reinstall/abort)" "upgrade" choice
+
+    case "$choice" in
+    u | upgrade) MODE="upgrade" ;;
+    r | reinstall) MODE="install" ;;
+    *)
+        info "Aborted, nothing changed."
+        exit 0
+        ;;
+    esac
+}
+
 # Main
 main() {
+    parse_args "$@"
+
     echo ""
     echo "  Paqet Server Installer"
     echo ""
 
     check_root
     check_arch
-    check_network_tools
+    check_required_tools
+    check_existing_install
+
+    if [[ "$MODE" == "upgrade" ]]; then
+        run_upgrade
+        return
+    fi
 
     echo ""
     info "Step 1/7: Server port"
